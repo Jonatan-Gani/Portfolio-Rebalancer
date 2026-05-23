@@ -1,0 +1,701 @@
+# Portfolio Rebalancer Engine — Wiki
+
+The single reference for understanding the system and developing it further.
+This file is self-contained: it absorbs the conceptual overview and the
+reproduction methodology, and adds the architecture, data flow, file-by-file
+internals, and a guide to extending the system.
+
+Visual styling is described where it touches behavior, but pixel-level design
+is not the focus — the focus is the engine, its contract, and how to build on
+it.
+
+---
+
+## Table of contents
+
+1. What the system does
+2. The math
+3. The five cash-flow modes
+4. Architecture and data flow
+5. File-by-file reference
+6. The engine internals
+7. The input contract — workbook schema
+8. The output contract — diagnostics
+9. Constants reference
+10. Edge cases
+11. Extending the system
+12. Reference test cases
+13. Reproduction checklist
+
+---
+
+## 1. What the system does
+
+A portfolio carries many exposures at once: currency mix, sector weights,
+average beta, average duration, region split. A mandate sets targets on
+several of them simultaneously, and the targets routinely contradict each
+other — no set of trades hits all of them exactly.
+
+The engine takes a portfolio and a set of target exposures and returns the
+single trade vector that minimizes the combined, priority-weighted miss
+across every target at once, under a chosen cash-flow rule. It also reports
+precisely which targets it could not reach and by how much.
+
+It is a pure function: same input, same output, every time. No state, no
+network, no randomness.
+
+Two ways to run it:
+
+- **As a library.** `rebalancer.py` is the standalone engine. Import it, call
+  `run(portfolio_df, targets_df, mode, params)`, get trades and diagnostics.
+- **As an app.** `app.py` is a Dash web app. Upload an Excel workbook, pick a
+  mode, drag a slider; results update live. The solver in the app is a
+  JavaScript port of the same engine, running in the browser.
+
+---
+
+## 2. The math
+
+### 2.1 Variables
+
+The portfolio has `n` holdings. Holding `i` has current dollar value `w0_i`;
+the total is `V0 = sum w0_i`. The decision variable is the trade vector `x`:
+`x_i` is the dollar change in holding `i`, positive a buy, negative a sell.
+After trading, holding `i` is worth `w0_i + x_i`.
+
+### 2.2 Deviation, in dollars
+
+A target dimension `d` has an exposure `a_i,d` per holding (1/0 for a category
+like "USD", or the raw number for a metric like beta) and a target level
+`t_d`. The natural thing to control is a weight,
+
+```
+weight_d(x) = sum_i a_i,d (w0_i + x_i)  /  sum_i (w0_i + x_i)
+```
+
+but `x` appears in the denominator — minimizing a function of that ratio is
+non-convex. Instead the engine controls the **dollar deviation**:
+
+```
+dev_d(x) = sum_{i in S_d} (a_i,d - t_d)(w0_i + x_i)
+```
+
+`S_d` is the dimension's scope (all holdings unless restricted). This is
+linear in `x`. A linear quantity squared is a convex quadratic; the whole
+problem becomes a convex QP with exactly one minimum, solved exactly and
+fast. `dev_d = 0` is exactly `weight_d = t_d` for a categorical dimension.
+
+Split it into a constant part and a trade part:
+
+```
+b_i,d = a_i,d - t_d   for i in S_d, else 0
+dev_d(x) = e_d + b_d . x      where  e_d = b_d . w0
+```
+
+`e_d` is the deviation before any trade; `b_d . x` is what a trade changes.
+
+### 2.3 The objective
+
+Each dimension contributes a scaled squared deviation:
+
+```
+f_d(x) = lambda_d * g_d * dev_d(x)^2
+```
+
+`lambda_d >= 0` is the dimension's priority — raise it to make that target
+win more trade-offs. `g_d` is a normalizer that blends two scalings evenly,
+one against the whole book and one against the dollars in the dimension's
+scope, so a small sleeve still gets a fair voice:
+
+```
+g_d = lambda_d * 0.5 * (1/V0^2 + 1/s_d^2)
+s_d = sum_{i in S_d} w0_i        (V0 used if the scope is empty)
+```
+
+The full objective adds a small turnover penalty so trades that do not
+measurably help any target are zeroed out:
+
+```
+minimize  F(x) = sum_d f_d(x)  +  tau * sum_i |x_i| / V0
+```
+
+In matrix form, dropping the constant `e_d^2`:
+
+```
+F(x) = (1/2) x' H x + c' x + const
+H = sum_d 2 g_d (b_d outer b_d)      n x n, symmetric PSD
+c = sum_d 2 g_d e_d b_d              length n
+```
+
+`H` is positive semidefinite — convex — but generally not strictly positive
+definite (with fewer targets than holdings, many trade vectors tie). A tiny
+diagonal ridge (`1e-7` after rescaling) makes it strictly positive definite,
+so the minimizer is unique and the linear algebra is well conditioned. The
+ridge is far too small to distort the answer; it only breaks ties, selecting
+the trade vector with least `x'x` among equally-good solutions.
+
+### 2.4 Constraints
+
+Box bounds, one per holding: a holding cannot be sold for more than it is
+worth, `x_i >= -w0_i`. Modes restrict further (`x_i <= 0` sells-only,
+`x_i >= 0` buys-only). Shorting, if enabled, relaxes the lower bound.
+
+One linear constraint, on net cash `sum_i x_i`, pinned or bounded by the mode
+(see §3).
+
+### 2.5 Optimality — KKT
+
+At the optimum `x*` there are multipliers `nu` (on the cash equality) and
+`z_i` (on the box bounds) with:
+
+- **Stationarity:** `H x* + c - nu g - z = 0` (`g` is all-ones).
+- **Primal feasibility:** `x*` satisfies all constraints.
+- **Complementary slackness:** an interior variable has `z_i = 0`; a variable
+  at its lower bound has `z_i <= 0`; at its upper bound, `z_i >= 0`.
+
+The sign rule is the stopping test: when every pinned variable's multiplier
+has the correct sign, no single move improves the objective, and because the
+problem is convex this is the global optimum.
+
+### 2.6 The solver — active-set
+
+If the active set (which variables end at a bound) were known, the problem
+would collapse to one small linear system. It is not known, so: guess, solve,
+check the KKT signs, correct, repeat. Each correction improves the objective;
+the number of possible active sets is finite, so it terminates — in practice
+in a handful of steps. Full step-by-step procedure in §6.3.
+
+### 2.7 A worked example
+
+Three holdings: A = 60,000 (USD), B = 30,000 (EUR), C = 10,000 (USD).
+`V0 = 100,000`. One target: USD share 0.50. Mode B (self-finance,
+`sum x = 0`).
+
+Currently USD is 70,000 / 100,000 = 70%, over the 50% target.
+`b = [0.5, -0.5, 0.5]`, `e = b.w0 = 20,000` over, `s = 70,000`,
+`g = 0.5(1/100000^2 + 1/70000^2) = 1.520e-10`. After rescaling the linear
+term is `c = [40000, -40000, 40000]`.
+
+The solver returns `x = [-10000, +20000, -10000]`: sell 10,000 each of the
+two USD names, buy 20,000 of the EUR name. Resulting holdings
+`[50000, 50000, 0]` — USD is now 50%, exactly on target. `cash_flow = 0`,
+`turnover = 40,000`, `rms_deviation = 0`.
+
+With one target the engine had freedom in how to split the USD selling
+between A and C. The ridge tie-break picks the least-`x'x` split, which sells
+C entirely. Add a second target and that freedom is spent satisfying it too
+— the engine trades off every dimension at once.
+
+---
+
+## 3. The five cash-flow modes
+
+The mode is the only behavioral switch. It fixes the cash constraint and the
+allowed trade signs; the objective is identical across all five.
+
+| Mode | Cash constraint | Trade signs | Parameter |
+|---|---|---|---|
+| A withdraw | `sum x = -W` | `x_i <= 0` (sells only) | withdrawal `W > 0` |
+| B self-finance | `sum x = 0` | free within box | none |
+| C min inject | `sum x >= 0` | free | penalty `mu` |
+| D deposit | `sum x = +D` | `x_i >= 0` (buys only) | deposit `D > 0` |
+| E perfect | `sum x >= 0` | free | none |
+
+- **A — Withdraw.** Raise exactly `W` in cash by selling; the engine chooses
+  the liquidation that leaves the rest closest to target.
+- **B — Self-finance.** No cash moves; sells fund buys. The routine
+  rebalance.
+- **C — Min injection.** Cash may be added but each dollar costs `mu`, so the
+  engine adds the least it can. When reallocation alone suffices, it adds
+  nothing and equals B.
+- **D — Deposit.** Fresh money in, buys only, existing positions untouched.
+- **E — Perfect.** Best fit at any cash cost (C with `mu = 0`). A miss that
+  survives E is structural — unreachable from the current universe.
+
+A residual that B leaves but E removes was a cash constraint. A residual that
+survives E is a limit of the holdings themselves.
+
+---
+
+## 4. Architecture and data flow
+
+The system has two execution paths that share one engine, expressed twice —
+once in Python, once in JavaScript.
+
+### 4.1 Library path
+
+```
+Excel workbook
+   |
+   |  read_sheets()           parse the two sheets
+   v
+portfolio_df, targets_df
+   |
+   |  build_dimensions()      validate, build Dimension objects
+   v
+pf, tk, val, dims
+   |
+   |  rebalance()             form QP, solve, diagnose
+   v
+{ trades, diagnostics }
+```
+
+`run()` chains these; `run_from_workbook()` adds the file read. All in
+`rebalancer.py`, all pure Python.
+
+### 4.2 App path
+
+```
+Browser: user uploads .xlsx
+   |
+   v
+Dash server (app.py)
+   |  read_sheets() + build_dimensions()      validate
+   |  widget.serialize()                      portfolio+targets -> JSON
+   |  widget.build_srcdoc()                   JSON + engine.js + widget_ui.js
+   |                                          + CSS -> one HTML string
+   v
+<iframe srcDoc="...">      sent to the browser, once
+   |
+   v
+Browser, inside the iframe:
+   engine.js     the solver, ported from rebalancer.py
+   widget_ui.js  controls, renders results
+   |
+   user drags slider / switches mode
+   |  -> solve happens here, in the browser, no server round-trip
+   v
+results re-render instantly
+```
+
+The key architectural decision: **the server parses, the browser solves.**
+The Dash server touches the workbook exactly once, to validate and serialize
+it. Everything interactive — every slider tick, every mode switch — runs the
+JavaScript engine locally in the iframe. This is why the slider is smooth: no
+network is involved in a solve.
+
+### 4.3 Why two copies of the engine
+
+`rebalancer.py` is the reference engine and the library API. `engine.js` is a
+line-for-line port for the browser. They implement the identical math and are
+verified to agree numerically. If you change the math, you must change both —
+see §11.
+
+---
+
+## 5. File-by-file reference
+
+```
+rebalancer.py     the engine + library API + CLI self-test   (Python)
+app.py            Dash web server: upload, validate, serve    (Python)
+widget.py         builds the iframe HTML (CSS + body + data)  (Python)
+engine.js         the solver, ported for the browser          (JavaScript)
+widget_ui.js      iframe controls and result rendering        (JavaScript)
+make_example.py   generates the example workbook              (Python)
+portfolio_example.xlsx   sample input, 30 assets
+requirements.txt  Python dependencies
+WIKI.md           this file
+```
+
+### rebalancer.py
+
+The whole engine. Key functions:
+
+- `_norm(s)` — normalize a string: lowercase, strip non-alphanumeric.
+- `_pick(cols, *cands)` — match a column name against candidates (exact, then
+  substring fallback).
+- `read_sheets(src)` — load the workbook, return the two DataFrames.
+- `Dimension` — dataclass: one target dimension with its precomputed exposure
+  and scope vectors.
+- `_portfolio_cols(pf)` — find the ticker and value columns.
+- `build_dimensions(pf, tg)` — validate the targets sheet against the
+  portfolio, build the `Dimension` list. Raises on any bad row.
+- `_solve_as(H, c, lo, hi, has_eq, rhs)` — the active-set QP solver.
+- `_diagnose(...)` — compute the diagnostics block from a trade vector.
+- `rebalance(pf, tk, val, dims, mode, params)` — form the QP for a mode,
+  solve, diagnose.
+- `run(portfolio_df, targets_df, mode, params)` — top-level entry; returns
+  `{ok, trades, diagnostics, ...}` or `{ok: False, error}`.
+- `run_from_workbook(src, mode, params)` — `run` plus the file read.
+- `make_example_workbook(path)` — writes a 10-asset CLI test workbook.
+  NOTE: this overwrites `portfolio_example.xlsx`; the 30-asset example comes
+  from `make_example.py` instead.
+- `selftest()` — runs all five modes on the example and asserts validation;
+  invoked by `python rebalancer.py`.
+
+### app.py
+
+The Dash server. Builds the page, handles the upload callback: parse the
+workbook, validate, on success call `widget.build_srcdoc` and put the
+returned HTML into the iframe; on failure show the error. The server does no
+solving.
+
+### widget.py
+
+Turns a validated workbook into the iframe. `serialize(pf, tk, val, dims)`
+flattens the portfolio and dimensions into a JSON payload (`holdings`,
+`dims`, `cols`). `build_srcdoc(...)` assembles the full self-contained HTML:
+CSS, the body markup, the serialized data, `engine.js`, and `widget_ui.js`.
+`EMPTY_SRCDOC` is the placeholder shown before any upload.
+
+### engine.js
+
+The browser engine. `dimExposure` / `dimScope` build a dimension's vectors
+from the raw data. `solveLin` is a dense linear solver (Gaussian elimination,
+partial pivoting). `solveAS` is the active-set QP. `rebalance` forms the QP
+and solves; `diagnose` builds the diagnostics. Mirrors `rebalancer.py`.
+
+### widget_ui.js
+
+The iframe UI. `buildTableHead` builds the merged portfolio+trades table
+header from the data's column list. `run` solves and renders everything —
+table, exposure bars, diagnostics. `solveCached` memoizes solves by
+mode+amount+mu+shorts. `scheduleRun` coalesces rapid slider input to one
+solve per animation frame. `warmup` pre-solves slider stops in idle time.
+`setMode`, `buildParams`, `bindSeg` wire the controls.
+
+### make_example.py
+
+Generates `portfolio_example.xlsx`: 30 assets (equities and bonds), profiling
+variables `asset_class, sector, currency, region, beta, duration`, and a
+targets sheet with 10 dimensions.
+
+---
+
+## 6. The engine internals
+
+### 6.1 Forming the QP
+
+For each dimension with exposure `a`, scope mask `m`, target `t`, lambda `L`:
+
+```
+b_i   = (a_i - t) if m_i else 0
+e0    = sum_i b_i * w0_i
+s     = sum_i w0_i over m_i true ;  s_eff = s if s > 1e-9 else V0
+g     = L * 0.5 * (1/V0^2 + 1/s_eff^2)
+```
+
+Accumulate `H += 2 g (b outer b)` and `c += 2 g e0 b`. Mode C adds `c_i +=
+mu` for all `i`.
+
+Rescale: `hs = max|H|` (1 if `hs < 1e-300`); `H /= hs`, `c /= hs`. Then
+`H_ii += 1e-7` (the ridge).
+
+Bounds: `lo_i = -w0_i` (or `-w0_i - 4*V0` with shorts), `hi_i = +inf`. Mode A
+sets `hi_i = 0`; mode D sets `lo_i = 0`. The cash constraint `g' x = rhs`
+with `g` all-ones and `rhs` per the mode table in §3.
+
+### 6.2 Modes C and E
+
+Their cash constraint is `sum x >= 0`. Solve box-only first (no equality); if
+the result has `sum x >= -1e-6`, keep it; else re-solve once with `sum x = 0`
+pinned.
+
+### 6.3 The active-set routine
+
+Inputs `H, c, lo, hi, has_eq, rhs`.
+
+**Feasible start.** `x_i = clamp(0, lo_i, hi_i)`. If `has_eq`, project onto
+the equality by a greedy sweep: with `resid = rhs - sum x`, walk holdings
+adding room toward `hi` (if `resid > 0`) or `lo` (if `resid < 0`) until
+`|resid| < 1e-12`.
+
+**Working set** `W_i`: 0 free, -1 pinned low, +1 pinned high. All start 0.
+
+**Iterate** up to `40n + 100` times:
+
+1. Free set `F = {i : W_i = 0}`.
+2. Gradient `grad = H x + c`.
+3. Build the KKT system, size `d = |F| + (1 if has_eq)`: top-left block is
+   `H` on `F`; if `has_eq`, the last row/column on the free part is 1 and the
+   corner is 0; right-hand side is `-grad` on `F` (and 0 for the equality
+   row). Solve it. The step `p` is `0` off `F` and the solution on `F`; `nu`
+   is the equality multiplier (0 if none).
+4. If `max|p| < 1e-9`: the free variables are EQP-optimal. For each pinned
+   `i`, the bound multiplier is `z = grad_i - nu`; the violation is `-z` if
+   pinned low, `z` if pinned high. Release the pinned variable with the
+   largest violation if it exceeds `1e-9`; otherwise the KKT signs all hold —
+   return `x`, the optimum.
+5. Else ratio-test along `p`: largest `alpha` in `[0,1]` keeping every free
+   variable inside its box. Take `x += alpha p`; if a variable blocked, pin
+   it exactly at the bound and set `W`.
+
+### 6.4 Post-processing
+
+After the solver returns: if long-only, clamp `x_i = max(x_i, -w0_i)` to kill
+sub-dollar drift. Then snap: `|x_i| < 40` becomes `x_i = 0`.
+
+### 6.5 Numerical scaling — why
+
+Raw `H` carries a factor `~1/V0^2`, around `1e-11` for a million-dollar book
+— working with numbers that small loses precision and makes the solver slow.
+Rescaling by `max|H|` brings `H` to order 1 without moving the minimizer
+(scaling an objective by a positive constant does not change its argmin).
+This is why the engine behaves identically on a 100-thousand and a
+100-million dollar portfolio.
+
+---
+
+## 7. The input contract — workbook schema
+
+One spreadsheet, two tables.
+
+### 7.1 Locating the tables
+
+Portfolio sheet: first whose normalized name contains `port`. Targets sheet:
+first whose normalized name contains `target` or `tgt`. If not found by name,
+fall back to order (first, second). Fewer than two sheets raises `workbook
+needs two sheets: portfolio, targets`.
+
+### 7.2 Column matching — the `pick` rule
+
+Normalize (lowercase, strip non-alphanumeric), then: exact match against the
+candidate list first; substring fallback second; absent if neither.
+
+Portfolio candidates:
+- ticker: `ticker, symbol, security, name, id, asset`
+- value: `value, marketvalue, mv, amount, dollars, notional, weight`
+
+Targets candidates:
+- label: `label, name, dimension, target, id`
+- attribute: `attribute, column, field, factor, variable, var, exposure`
+- match value: `matchvalue, value, category, bucket, level, member, class`
+- target: `target, targetvalue, goal, weighttarget`
+- lambda: `lambda, priority, lam, importance`
+- scope attribute: `scopeattribute, scopecolumn, scopefield`
+- scope value: `scopevalue, scopecategory, scopebucket`
+
+Collision overrides: if the label column resolved to the same column as
+target, label becomes absent; same for match value. Missing ticker/value, or
+missing attribute/target, raises an error.
+
+### 7.3 Row processing
+
+Portfolio: drop rows with empty ticker; coerce value to numeric (unparseable
+→ 0); every other column is a free-form profiling variable.
+
+Targets: each row is one dimension, unless its attribute cell is empty
+(skipped). The attribute must name a portfolio column, else the row records
+an error. Match value present → categorical (`unit = "share"`); absent →
+numeric (`unit = "num"`). Target must parse to a number. Lambda defaults to
+1.0. Label defaults to the match value or attribute name. Scope is optional;
+a given scope attribute must be a portfolio column. One bad row rejects the
+whole workbook — all errors are joined and raised together.
+
+### 7.4 Exposure and scope vectors
+
+Categorical exposure: 1.0 where the attribute column's stripped string equals
+the match value (case-sensitive), else 0.0. Numeric exposure: the attribute
+column coerced to number, unparseable → 0.0. Scope mask: all true if no
+scope; else true where the scope column's stripped string equals the scope
+value.
+
+The example workbook's `targets` sheet uses columns `label, attribute,
+match_value, target, lambda, scope_attribute, scope_value` — but any names
+matching the candidate lists work.
+
+---
+
+## 8. The output contract — diagnostics
+
+`run()` returns `{ok: True, trades, diagnostics, v0, n_holdings}` on success,
+or `{ok: False, error}` on a validation failure.
+
+`trades` — one entry per holding, portfolio order: `ticker, now (= w0_i),
+dx (= x_i), after (= w0_i + x_i), side` (`buy` if `dx > 1e-6`, `sell` if
+`< -1e-6`, else `hold`).
+
+`diagnostics`:
+
+- `solver_status` — `optimal`, or `trivial` when there are no dimensions.
+- `mode` — the mode letter.
+- `cash_flow = sum x_i`, `turnover = sum |x_i|`, `new_value = V0 + cash_flow`.
+- `per_dim_residuals` — per dimension: `label, attribute, unit, target,
+  current` (exposure before), `achieved` (exposure after), `residual_pct`,
+  `residual_dollars` (the dollar deviation `dev`), `residual_weighted` (the
+  dimension's weighted objective term), `lambda`.
+- `rms_deviation` — RMS of `residual_pct` over dimensions with `lambda > 0`.
+- `worst_dim` — label of the dimension with the largest
+  `|residual_weighted|`.
+- `shorts_opened` — tickers whose resulting holding is below `-1.0`.
+- `objective_value` — the objective at the solution.
+
+`residual_pct` uses one of three formulas: `(achieved - target)/target` if
+the target is nonzero; else `achieved/new_value` if the dimension is
+unscoped; else `achieved/Sv` (scoped, zero target). NaN/inf → 0.
+
+The exact field names are part of the contract — `widget_ui.js` and any
+integration bind to them.
+
+---
+
+## 9. Constants reference
+
+| Constant | Value | Role | Where |
+|---|---|---|---|
+| `TAU` | `1e-4` | turnover-penalty weight | objective |
+| ridge | `1e-7` | diagonal regularizer after rescale | QP build |
+| snap | `40` | trades below this (abs $) zeroed | post-process |
+| short bound | `4 * V0` | extra room below `-w0_i` with shorts | bounds |
+| active-set tol | `1e-9` | step / multiplier zero-threshold | solver |
+| active-set cap | `40n + 100` | iteration limit | solver |
+| short flag | `1.0` | resulting holding below this (negative) = short | diagnostics |
+| `mu` presets | `1e-8` / `1.5e-7` / `2e-6` | mode C cash penalty (low/med/high) | mode C |
+
+These are part of the specification, not tunable knobs — changing them
+changes the output.
+
+---
+
+## 10. Edge cases
+
+- **Zero dimensions** — valid workbook, no target rows: returns all-`hold`,
+  `solver_status = "trivial"`.
+- **Empty scope** — `s = 0`, so `s_eff = V0`; the dimension still enters with
+  whole-book scaling only.
+- **Zero-value holding** — in sells-only / self-finance it is pinned at 0 and
+  cannot be funded; in deposit mode it can be bought into; with shorts it can
+  go positive from 0.
+- **Non-numeric value cells** — coerced to 0.
+- **Non-numeric target** — rejects that row; **non-numeric lambda** — falls
+  back to 1.0.
+- **Categorical match hitting nothing** — exposure all-zero; the engine
+  trades toward the (unreachable) target as far as the universe allows.
+- **`V0 <= 0`** — raises `portfolio total value must be positive`.
+- Invariant: `new_value` always equals `V0 + cash_flow` exactly.
+
+---
+
+## 11. Extending the system
+
+### 11.1 Add a target dimension or a new metric
+
+No code change. Add a row to the targets sheet; if it is a new metric, also
+add the column to the portfolio sheet. The only rule: the targets-row
+`attribute` must name a portfolio column. `build_dimensions` builds one more
+`Dimension` and the solver includes it. This is the system working as
+designed — it is generic over dimensions.
+
+### 11.2 Change the math
+
+If you change the objective, the constraints, or the solver, you must change
+**both** `rebalancer.py` and `engine.js` — they are two copies of one engine.
+After any such change, re-run the cross-check: solve the same workbook with
+both and confirm the trade vectors and diagnostics agree (see §12). A change
+to one without the other silently desynchronizes the library and the app.
+
+### 11.3 Add a cash-flow mode
+
+A mode is defined entirely by (a) the cash constraint and (b) the trade-sign
+bounds. To add one: in `rebalance` (both files) add a branch that sets `lo`,
+`hi`, and the cash constraint, then add the mode letter to the UI mode picker
+in `widget_ui.js` and its description in `MDESC`. No solver change is needed
+— the active-set routine already handles any box + single-equality QP.
+
+### 11.4 Add a diagnostic field
+
+Compute it in `_diagnose` (Python) and `diagnose` (JS), add it to the
+returned `diagnostics` object in both, and render it in `widget_ui.js`'s
+`run` (the diagnostics grid). Keep the field name identical across all three.
+
+### 11.5 Add a new objective term
+
+A new penalty (e.g. a transaction-cost model, a tracking-error term) enters
+as additional contributions to `H` and `c` in `rebalance`. As long as the new
+term keeps `H` positive semidefinite, the QP stays convex and the active-set
+solver needs no change. A non-convex term (variance of holdings, drawdown)
+would break the solver — that class of objective is deliberately out of
+scope; see §13.
+
+### 11.6 Change the input format
+
+The engine never sees Excel directly — `read_sheets` returns two DataFrames
+and everything downstream is format-agnostic. To accept CSV pairs, a
+database, or an API payload, replace `read_sheets` with something that
+returns the same `(portfolio_df, targets_df)` shape. Nothing else changes.
+
+### 11.7 Performance notes
+
+The active-set solver is exact and fast for tens of holdings (single-digit
+milliseconds). For hundreds of holdings the dense KKT solve (O(n^3) per
+iteration) would dominate; a sparse factorization or a warm-started
+factorization update would be the next step. The browser path additionally
+memoizes solves (`solveCached`) and pre-warms slider stops (`warmup`), so
+revisiting a slider position is instant.
+
+---
+
+## 12. Reference test cases
+
+### 12.1 The 10-asset CLI workbook
+
+`make_example_workbook()` writes this; `python rebalancer.py` solves it.
+Portfolio columns `ticker, value, sector, fx, beta`; 10 holdings totalling
+`V0 = 1,000,000`. Targets: USD 50%, EUR 50%, Tech 40%, Financials 40%, beta
+1.00; all `lambda = 1`, no scope.
+
+Expected (A withdraws 150,000; D deposits 200,000; C `mu = 1.5e-7`;
+long-only):
+
+```
+A:  optimal,  cash -150,000,  rms ~20.9%
+B:  optimal,  cash        0,  rms ~0.00%
+C:  optimal,  cash        0,  rms ~0.00%
+D:  optimal,  cash +200,000,  rms ~12.1%
+E:  optimal,  cash        0,  rms ~0.00%
+```
+
+B, C, E coincide and inject nothing — the targets are reachable by
+reallocation alone. A and D are one-directional and leave real residuals.
+
+### 12.2 Validation
+
+Point a targets-row attribute at a non-existent portfolio column;
+`build_dimensions` must raise `target row K: attribute 'NAME' not in
+portfolio columns [...]`.
+
+### 12.3 The three-asset worked example
+
+§2.7: holdings 60k/30k/10k, one USD-share-0.50 target, mode B. Solution
+`x = [-10000, +20000, -10000]`, holdings `[50000, 50000, 0]`, USD share
+exactly 0.50, `cash_flow = 0`, `turnover = 40,000`, `rms_deviation = 0`.
+
+### 12.4 Python / JavaScript agreement
+
+Solve any workbook with `rebalancer.py` and with `engine.js` and confirm the
+trade vectors agree to within a dollar per holding and the diagnostics to 4
+significant figures. This is the regression test after any math change.
+
+---
+
+## 13. Reproduction checklist
+
+A faithful rebuild satisfies all of:
+
+1. Two-table input located by the name/order rule (§7.1).
+2. Columns identified by the exact `pick` rule and candidate lists (§7.2),
+   including the two `target`-collision overrides.
+3. Row processing with the exact skip/coerce/default rules (§7.3); one bad
+   row rejects the whole workbook.
+4. Exposure and scope vectors per §7.4 (categorical = case-sensitive stripped
+   equality; numeric = coerced number).
+5. Objective `H, c` per §6.1 with the dual `g` scaling.
+6. Rescale by `max|H|`, then add the `1e-7` ridge.
+7. Bounds and cash constraint per mode (§3, §6.1).
+8. Active-set solver exactly as §6.3 — feasible-start projection, KKT
+   assembly, multiplier sign test, ratio test.
+9. C and E handled by solve-free-then-pin (§6.2).
+10. Post-processing: long-only clamp then snap (§6.4).
+11. Diagnostics per §8 with the exact field names and three-way
+    `residual_pct` rule.
+12. All edge cases of §10.
+13. The §12 test cases reproduced to the stated precision.
+
+### Scope and limits
+
+The engine optimizes deviation from explicit exposure targets. It does not
+optimize risk-based objectives — variance, tracking error, drawdown — which
+are quadratic-or-worse and non-convex in the holdings and would break the
+active-set solver. Targets are soft goals balanced by priority, not hard
+constraints; the cash-flow rule of the chosen mode is the only hard
+constraint, plus the no-short rule unless shorting is enabled.
