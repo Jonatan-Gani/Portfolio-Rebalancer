@@ -825,17 +825,32 @@ A faithful rebuild satisfies all of:
    row rejects the whole workbook.
 4. Exposure and scope vectors per §7.4 (categorical = case-sensitive stripped
    equality; numeric = coerced number).
-5. Objective `H, c` per §6.1 with the dual `g` scaling.
-6. Rescale by `max|H|`, then add the `1e-7` ridge.
-7. Bounds and cash constraint per mode (§3, §6.1).
+5. Variables `y = [u; v]` of length `2n` per §2.1; objective `H, c` over `y`
+   per §6.1 with the dual `g` scaling and the `beta_d = [b_d; -b_d]` stack.
+6. Commission term per §2.3: `c[u_i] += theta k_i / V0` and
+   `c[v_i] += theta k_i / V0`; rescale by `max|H|`, then add the `1e-7`
+   ridge.
+7. Bounds (`u_i >= 0`, `v_i in [0, w0_i]` or `[0, w0_i + 4 V0]` with shorts)
+   and cash constraint `sum_i (u_i - v_i) = rhs` per mode (§3, §6.1); mode
+   pinning of `u_i = 0` (A) or `v_i = 0` (D).
 8. Active-set solver exactly as §6.3 — feasible-start projection, KKT
-   assembly, multiplier sign test, ratio test.
+   assembly, multiplier sign test, ratio test — operating on the `2n`
+   system.
 9. C and E handled by solve-free-then-pin (§6.2).
-10. Post-processing: long-only clamp then snap (§6.4).
-11. Diagnostics per §8 with the exact field names and three-way
+10. Cost/completion frontier per §6.6: `theta` ladder anchored to the
+    portfolio, adaptive refinement on `rho` gaps,
+    `rho = (R_0 - J_dev)/(R_0 - R_perfect)`, sweep solve cap.
+11. Knee detection per §6.7: chord-distance argmax with `d_max` as
+    sharpness, `KNEE_MIN_LEG` gate for "no sharp knee".
+12. Post-processing: long-only clamp throughout; snap (§6.4) applied only to
+    the final chosen solution, not to sweep solves.
+13. Diagnostics per §8 with the exact field names — including `total_cost`,
+    `cost_bps`, `objective_deviation`, `objective_cost`, `rho_achieved`,
+    `knee_rho`, `knee_leg`, `frontier`, `snap_delta`, `cost_tier`,
+    `cost_affects`, and per-trade `trade_cost` — and the three-way
     `residual_pct` rule.
-12. All edge cases of §10.
-13. The §12 test cases reproduced to the stated precision.
+14. All edge cases of §10.
+15. The §12 test cases reproduced to the stated precision.
 
 ### Scope and limits
 
