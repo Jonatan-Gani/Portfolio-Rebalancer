@@ -58,10 +58,22 @@ Two ways to run it:
 
 ### 2.1 Variables
 
-The portfolio has `n` holdings. Holding `i` has current dollar value `w0_i`;
-the total is `V0 = sum w0_i`. The decision variable is the trade vector `x`:
-`x_i` is the dollar change in holding `i`, positive a buy, negative a sell.
-After trading, holding `i` is worth `w0_i + x_i`.
+The portfolio has `n` holdings. Holding `i` has current dollar value
+`w0_i`; the total is `V0 = sum w0_i`.
+
+Each holding is traded through two non-negative variables: a buy `u_i >= 0`
+and a sell `v_i >= 0`. The net dollar change in holding `i` is
+`x_i = u_i - v_i` — positive a net buy, negative a net sell — and after
+trading the holding is worth `w0_i + x_i`. The decision vector is
+`y = [u; v]`, length `2n`.
+
+The split exists because the transaction-cost term (§2.3) charges the
+*gross* dollars traded, `|x_i|`, which is not differentiable in a single
+signed variable. With the split, gross traded dollars are `u_i + v_i`, a
+linear quantity. At any optimum with a positive cost on holding `i`, `u_i`
+and `v_i` are never both positive — buying and selling the same name only
+burns cost — so `|x_i| = u_i + v_i` holds exactly. Always read the trade as
+`x_i = u_i - v_i`; never read `u_i` or `v_i` alone.
 
 ### 2.2 Deviation, in dollars
 
@@ -94,54 +106,69 @@ dev_d(x) = e_d + b_d . x      where  e_d = b_d . w0
 
 `e_d` is the deviation before any trade; `b_d . x` is what a trade changes.
 
+Because `dev_d` is linear in `x` and `x_i = u_i - v_i`, the deviation is
+linear in `y` with coefficient vector
+
+```
+beta_d = [ b_d ; -b_d ]        length 2n
+```
+
+and the same constant `e_d = b_d . w0`. Everything downstream is assembled
+from `beta_d` over `y` exactly as it was from `b_d` over `x`.
+
 ### 2.3 The objective
 
-Each dimension contributes a scaled squared deviation:
+Each dimension contributes a scaled squared deviation `f_d` exactly as
+before — `lambda_d` its priority, `g_d` the dual normalizer of §2.3's
+original `g_d` formula (unchanged).
+
+The objective also prices trading. Each holding has a commission rate
+`k_i >= 0`, a fraction of traded notional (§7 — read from the portfolio
+sheet, or a flat default when absent). Gross dollars traded on holding `i`
+are `u_i + v_i`, so the commission cost is
 
 ```
-f_d(x) = lambda_d * g_d * dev_d(x)^2
+cost(y) = sum_i k_i (u_i + v_i)
 ```
 
-`lambda_d >= 0` is the dimension's priority — raise it to make that target
-win more trade-offs. `g_d` is a normalizer that blends two scalings evenly,
-one against the whole book and one against the dollars in the dimension's
-scope, so a small sleeve still gets a fair voice:
+The full objective is
 
 ```
-g_d = lambda_d * 0.5 * (1/V0^2 + 1/s_d^2)
-s_d = sum_{i in S_d} w0_i        (V0 used if the scope is empty)
+minimize  F(y) = sum_d f_d(y)  +  theta * cost(y) / V0
 ```
 
-The full objective adds a small turnover penalty so trades that do not
-measurably help any target are zeroed out:
+`theta >= 0` is the cost-aversion weight. Dividing `cost` by `V0` keeps the
+term scale-free, so the engine behaves identically across book sizes
+(§6.5). `theta` is not a user-facing knob — it is the variable swept to
+trace the cost/completion frontier (§6.6); the user-facing control is the
+completion fraction `rho` (§6.7).
 
-```
-minimize  F(x) = sum_d f_d(x)  +  tau * sum_i |x_i| / V0
-```
+This term replaces the former flat turnover penalty `TAU`. With a single
+commission rate `k_i = k` for every holding, `theta * k * sum(u_i+v_i)/V0`
+is exactly the old turnover penalty, so the previous behavior is the
+uniform-rate special case.
 
-In matrix form, dropping the constant `e_d^2`:
-
-```
-F(x) = (1/2) x' H x + c' x + const
-H = sum_d 2 g_d (b_d outer b_d)      n x n, symmetric PSD
-c = sum_d 2 g_d e_d b_d              length n
-```
-
-`H` is positive semidefinite — convex — but generally not strictly positive
-definite (with fewer targets than holdings, many trade vectors tie). A tiny
-diagonal ridge (`1e-7` after rescaling) makes it strictly positive definite,
-so the minimizer is unique and the linear algebra is well conditioned. The
-ridge is far too small to distort the answer; it only breaks ties, selecting
-the trade vector with least `x'x` among equally-good solutions.
+In matrix form the deviation part is `(1/2) y' H y + c' y` with `H` and `c`
+accumulated from `beta_d` (§2.2) over the `2n` variables; the commission
+part adds `theta k_i / V0` to the `c` entry of every `u_i` and every `v_i`.
+`H` is positive semidefinite; the §2.3 ridge still applies after rescaling
+and makes the minimizer unique.
 
 ### 2.4 Constraints
 
-Box bounds, one per holding: a holding cannot be sold for more than it is
-worth, `x_i >= -w0_i`. Modes restrict further (`x_i <= 0` sells-only,
-`x_i >= 0` buys-only). Shorting, if enabled, relaxes the lower bound.
+Non-negativity on every traded variable: `u_i >= 0`, `v_i >= 0`. A holding
+cannot be sold for more than it is worth, so `v_i <= w0_i`. Buys are
+unbounded above. Shorting, if enabled, raises the sell bound to
+`w0_i + 4 V0`.
 
-One linear constraint, on net cash `sum_i x_i`, pinned or bounded by the mode
-(see §3).
+One linear constraint on net cash:
+`sum_i (u_i - v_i) = rhs`, with `rhs` pinned or bounded by the mode (§3).
+
+Modes restrict trade direction by pinning a block to zero: mode A
+(sells only) pins every `u_i = 0`; mode D (buys only) pins every `v_i = 0`;
+modes B, C, E pin neither. The problem stays a box-bounded QP with a single
+linear equality — the structure the active-set solver (§2.6, §6.3) is built
+for — only now over `2n` variables.
 
 ### 2.5 Optimality — KKT
 
@@ -157,6 +184,9 @@ The sign rule is the stopping test: when every pinned variable's multiplier
 has the correct sign, no single move improves the objective, and because the
 problem is convex this is the global optimum.
 
+The KKT system is assembled over the `2n` variables `y`; the stationarity,
+feasibility and complementary-slackness conditions are otherwise unchanged.
+
 ### 2.6 The solver — active-set
 
 If the active set (which variables end at a bound) were known, the problem
@@ -164,6 +194,10 @@ would collapse to one small linear system. It is not known, so: guess, solve,
 check the KKT signs, correct, repeat. Each correction improves the objective;
 the number of possible active sets is finite, so it terminates — in practice
 in a handful of steps. Full step-by-step procedure in §6.3.
+
+The active-set routine is unchanged — it already handles any box-bounded,
+single-equality QP; the cost model only enlarges the system from `n` to `2n`
+variables.
 
 ### 2.7 A worked example
 
@@ -185,6 +219,12 @@ With one target the engine had freedom in how to split the USD selling
 between A and C. The ridge tie-break picks the least-`x'x` split, which sells
 C entirely. Add a second target and that freedom is spent satisfying it too
 — the engine trades off every dimension at once.
+
+In the `u/v` formulation the same solution reads `u = [0, 20000, 0]`,
+`v = [10000, 0, 10000]`: holding A and C are pure sells, B a pure buy, no
+holding both bought and sold. The net trade `x = u - v` is the
+`[-10000, +20000, -10000]` above. The numbers are unchanged; the split is a
+reformulation, not a different answer.
 
 ---
 
@@ -366,24 +406,19 @@ targets sheet with 10 dimensions.
 
 ### 6.1 Forming the QP
 
-For each dimension with exposure `a`, scope mask `m`, target `t`, lambda `L`:
+For each dimension build `b_d`, `e_d`, `s_d`, `g_d` exactly as before, then
+the `2n` deviation coefficient `beta_d = [b_d; -b_d]`. Accumulate
+`H += 2 g_d (beta_d outer beta_d)` and `c += 2 g_d e_d beta_d`.
 
-```
-b_i   = (a_i - t) if m_i else 0
-e0    = sum_i b_i * w0_i
-s     = sum_i w0_i over m_i true ;  s_eff = s if s > 1e-9 else V0
-g     = L * 0.5 * (1/V0^2 + 1/s_eff^2)
-```
+Add commission: for every holding `i`, `c[u_i] += theta k_i / V0` and
+`c[v_i] += theta k_i / V0`.
 
-Accumulate `H += 2 g (b outer b)` and `c += 2 g e0 b`. Mode C adds `c_i +=
-mu` for all `i`.
+Rescale by `max|H|` and add the `1e-7` ridge as in the original §6.1, now
+on the `2n` system.
 
-Rescale: `hs = max|H|` (1 if `hs < 1e-300`); `H /= hs`, `c /= hs`. Then
-`H_ii += 1e-7` (the ridge).
-
-Bounds: `lo_i = -w0_i` (or `-w0_i - 4*V0` with shorts), `hi_i = +inf`. Mode A
-sets `hi_i = 0`; mode D sets `lo_i = 0`. The cash constraint `g' x = rhs`
-with `g` all-ones and `rhs` per the mode table in §3.
+Bounds: `u_i in [0, +inf)`, `v_i in [0, w0_i]` (sell bound `w0_i + 4 V0`
+with shorts). Mode A pins all `u_i = 0`; mode D pins all `v_i = 0`. Cash
+constraint `sum_i (u_i - v_i) = rhs` per the §3 mode table.
 
 ### 6.2 Modes C and E
 
@@ -425,6 +460,12 @@ adding room toward `hi` (if `resid > 0`) or `lo` (if `resid < 0`) until
 After the solver returns: if long-only, clamp `x_i = max(x_i, -w0_i)` to kill
 sub-dollar drift. Then snap: `|x_i| < 40` becomes `x_i = 0`.
 
+When the engine traces the cost/completion frontier (§6.6), the `$40` snap
+is disabled for every sweep solve — snap is post-processing, not
+optimization, and leaving it on puts spurious steps in the frontier. Snap
+is applied once, to the final chosen solution only (§6.7). The long-only
+clamp is a feasibility correction and stays on throughout.
+
 ### 6.5 Numerical scaling — why
 
 Raw `H` carries a factor `~1/V0^2`, around `1e-11` for a million-dollar book
@@ -433,6 +474,74 @@ Rescaling by `max|H|` brings `H` to order 1 without moving the minimizer
 (scaling an objective by a positive constant does not change its argmin).
 This is why the engine behaves identically on a 100-thousand and a
 100-million dollar portfolio.
+
+### 6.6 The cost/completion frontier
+
+A single solve of `F(y)` answers one `theta`. To expose the cost/quality
+tradeoff the engine solves a ladder of `theta` values and records, for
+each, the pair (commission cost, deviation achieved). `theta = 0` is the
+cheapest-quality-ignored solve and reaches the best deviation the mode
+allows; large `theta` drives trading toward zero.
+
+Deviation is reported as a completion fraction. Let `J_dev` be the
+deviation objective (the `f_d` sum, cost excluded). With `R_0 = J_dev` at
+no trade and `R_perfect = J_dev` at the `theta = 0` solve,
+
+```
+rho = (R_0 - J_dev) / (R_0 - R_perfect)
+```
+
+`rho = 0` is no progress, `rho = 1` a perfect rebalance. `rho` is unit-free
+and book-independent. It measures completion in *residual*, not turnover —
+the early, cheap dollars of trading close most of the miss, so a high `rho`
+can cost far less than a proportional share of full-rebalance turnover.
+That gap is the diminishing-returns shape of the frontier and the reason a
+knee exists (§6.7).
+
+`R_0`, `R_perfect` and the frontier are all mode-specific. The `theta`
+ladder is anchored to the portfolio and refined where the frontier is
+sparsely sampled; details in `COST_SPEC.md` §S7.
+
+### 6.7 The knee — the default operating point
+
+The frontier is concave: each additional unit of completion costs more than
+the last. Its knee is the point where the curve turns from steep to flat —
+before it, cost buys substantial completion; after it, cost buys almost
+none. The knee is the engine's default operating point: it is where the
+marginal cost of further completion has risen to meet its marginal benefit,
+so trading past it spends a dollar to save less than a dollar.
+
+The knee is located by maximum distance to the chord. Normalize both
+frontier axes to `[0,1]` (`rho` already is; `c_norm = cost / cost_max`).
+Draw the chord from the no-trade endpoint `(0,0)` to the full-rebalance
+endpoint `(1,1)` — the chord is the rebalance's average cost per unit of
+completion. For each frontier point the engine measures the perpendicular
+distance to that chord,
+
+```
+d_j = ( rho_j - c_norm_j ) / sqrt(2)
+```
+
+and the knee is the point of greatest distance, `argmax_j d_j`.
+Equivalently the knee is where the curve's local slope equals the chord's
+slope — below the knee the curve completes faster than its average rate,
+above it slower. The two views describe the same point.
+
+The longest distance `d_max` doubles as the knee's sharpness. A pronounced
+knee bows far from the chord; a gently bowed frontier with no real corner
+hugs it. If `d_max` falls below a calibrated minimum the engine reports no
+sharp optimum and defers the choice to the user rather than marking a knee
+that is not there.
+
+The knee is computed on the true (un-snapped) frontier. The final solution
+— the knee, or a user override along `rho` — is solved once at the
+corresponding `theta`, then snapped (§6.4); the engine reports the small
+shift snapping causes so the delivered figures, not the idealized ones, are
+what the user sees.
+
+Because the frontier is the *cost-inclusive* one, the knee location depends
+on the commission rates: a costlier book moves the knee toward less
+trading, a cheap book toward more. This coupling is automatic.
 
 ---
 
@@ -527,13 +636,28 @@ unscoped; else `achieved/Sv` (scoped, zero target). NaN/inf → 0.
 The exact field names are part of the contract — `widget_ui.js` and any
 integration bind to them.
 
+The cost model adds to `diagnostics`: `total_cost` (commission paid, $),
+`cost_bps` (`total_cost / V0 * 1e4`), `objective_deviation` and
+`objective_cost` (the two terms of `objective_value`, reported
+separately), `rho_achieved` (completion fraction of the delivered
+solution), `knee_rho` (knee location, or null when no sharp knee),
+`knee_leg` (`d_max`, the longest perpendicular distance — the sharpness
+measure), `frontier` (the swept `(rho, cost, J_dev)` points),
+`snap_delta` (the `rho` and cost shift from snapping the final solution),
+and `cost_tier` (0 no cost data, 1 commission). Each `trades` entry gains
+`trade_cost`, the commission on that holding.
+
+In pinned-cash modes (A, D) total traded volume is largely fixed by the
+cash target, so commission steers *which* holdings trade, not how much; in
+B, C, E it also reduces total turnover. The field `cost_affects`
+(`"selection"` or `"selection+volume"`) records which.
+
 ---
 
 ## 9. Constants reference
 
 | Constant | Value | Role | Where |
 |---|---|---|---|
-| `TAU` | `1e-4` | turnover-penalty weight | objective |
 | ridge | `1e-7` | diagonal regularizer after rescale | QP build |
 | snap | `40` | trades below this (abs $) zeroed | post-process |
 | short bound | `4 * V0` | extra room below `-w0_i` with shorts | bounds |
@@ -541,9 +665,20 @@ integration bind to them.
 | active-set cap | `40n + 100` | iteration limit | solver |
 | short flag | `1.0` | resulting holding below this (negative) = short | diagnostics |
 | `mu` presets | `1e-8` / `1.5e-7` / `2e-6` | mode C cash penalty (low/med/high) | mode C |
+| `COST_DEFAULT` | `8e-4` (8 bps) | flat commission rate when no cost column is present | QP build |
+| blank-cell percentile | 90th | default for blank cells of a present cost column | input parsing |
+| `theta` ladder | `10^-3..10^3`, 25 pts + 0 | initial frontier sweep grid | §6.6 |
+| `theta` refine gap | `0.05` in `rho` | adaptive resampling trigger | §6.6 |
+| sweep solve cap | 60 | max solves per frontier | §6.6 |
+| `KNEE_MIN_LEG` | calibrated | min perpendicular distance for a sharp knee | §6.7 |
 
 These are part of the specification, not tunable knobs — changing them
-changes the output.
+changes the output. `COST_DEFAULT`, the percentile, the ladder and the
+solve cap are specification — changing them changes output. `KNEE_MIN_LEG`
+is a detector-sensitivity threshold (a distance on the normalized unit
+square, bounded by `1/sqrt(2)`), calibrated on real frontiers, not derived.
+`TAU` (formerly the turnover-penalty weight) is superseded by the
+commission term in §2.3 and no longer exists as a constant.
 
 ---
 
@@ -598,14 +733,25 @@ Compute it in `_diagnose` (Python) and `diagnose` (JS), add it to the
 returned `diagnostics` object in both, and render it in `widget_ui.js`'s
 `run` (the diagnostics grid). Keep the field name identical across all three.
 
-### 11.5 Add a new objective term
+### 11.5 The cost model and its extension
 
-A new penalty (e.g. a transaction-cost model, a tracking-error term) enters
-as additional contributions to `H` and `c` in `rebalance`. As long as the new
-term keeps `H` positive semidefinite, the QP stays convex and the active-set
-solver needs no change. A non-convex term (variance of holdings, drawdown)
-would break the solver — that class of objective is deliberately out of
-scope; see §13.
+Transaction cost is part of the core engine (§2.3): a linear commission
+term, per-asset rate `k_i`, entering `c` over the buy/sell-split variables.
+It is convex, so the QP and the active-set solver are unaffected.
+
+Market impact — a cost that grows faster than trade size — is the supported
+**extension**. It is modelled as a quadratic term `sum_i q_i x_i^2`, which
+is convex and drops straight onto the diagonal of `H` (the Hessian of
+`q_i (u_i - v_i)^2`), again with no solver change. It is opt-in because the
+impact coefficient `q_i` is a derived quantity — typically
+`q_i ~ c sigma_i / ADV_i` from volatility and average daily volume — and
+most mandates do not supply it. Absent the data, the term is simply off.
+Implementation detail in `COST_SPEC.md` §S2, §S5.
+
+A non-convex cost — fixed per-ticket fees (a 0/1 indicator on whether a
+holding trades) or concave economies-of-scale pricing — would break the
+active-set solver and is out of scope; the `$40` snap (§6.4) is the
+pragmatic stand-in for fixed-fee avoidance.
 
 ### 11.6 Change the input format
 
@@ -699,3 +845,8 @@ are quadratic-or-worse and non-convex in the holdings and would break the
 active-set solver. Targets are soft goals balanced by priority, not hard
 constraints; the cash-flow rule of the chosen mode is the only hard
 constraint, plus the no-short rule unless shorting is enabled.
+
+Transaction cost is priced and optimized: a linear commission term in the
+core objective, with market impact available as a convex quadratic
+extension. Cost is a priced soft term, not a hard constraint — the
+cash-flow rule of the mode remains the only hard constraint.
