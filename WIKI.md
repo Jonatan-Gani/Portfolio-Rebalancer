@@ -26,6 +26,7 @@ it.
 11. Extending the system
 12. Reference test cases
 13. Reproduction checklist
+14. Mathematical concepts index
 
 ---
 
@@ -894,3 +895,185 @@ term (tier 1) and a convex quadratic market-impact term (tier 2), each
 gated on the corresponding portfolio column, with a flat fallback at
 tier 0. Cost is a priced soft term, not a hard constraint — the cash-flow
 rule of the mode remains the only hard constraint.
+
+---
+
+## 14. Mathematical concepts index
+
+A reference for the moderate-to-higher-difficulty concepts the WIKI invokes.
+One or two sentences each, organized by area so the index doubles as a
+study path. Section references point back into this document.
+
+### 14.1 Convex optimization and QP theory
+
+**Convex optimization.** Minimizing a convex function over a convex feasible
+set. The crucial consequence: any local minimum is the global minimum, so
+the active-set routine can stop at the first KKT-satisfying point without
+worrying about being stuck in a basin.
+
+**Quadratic programming (QP).** A convex optimization problem whose
+objective is quadratic in the variables, `(1/2) y' H y + c' y`, under linear
+equality and inequality constraints. The rebalancer's per-`theta` solve is
+exactly one QP (§2.3).
+
+**Quadratic form.** A scalar expression `y' M y` for a symmetric matrix
+`M`. The sign of `y' M y` for nonzero `y` classifies `M` as positive
+(semi)definite, negative (semi)definite, or indefinite — which in turn
+fixes whether the parent QP is strictly convex, convex, or non-convex.
+
+**Positive semidefinite (PSD) and positive definite (PD).** A symmetric
+matrix `H` is PSD if `y' H y >= 0` for every `y`, PD if the inequality is
+strict for every nonzero `y`. PSD makes a QP convex; the `1e-7 * I` ridge
+(§2.3) lifts it to PD so the minimizer is unique.
+
+**Hessian matrix.** The matrix of second partial derivatives of a scalar
+function. For a QP objective the Hessian is the matrix `H` itself, and
+convexity of the objective is exactly the PSD property of `H` (§2.3,
+§11.5).
+
+**Box constraints.** Component-wise bounds `lo_i <= y_i <= hi_i`. The
+active-set method in §6.3 is built specifically for problems that are box
+plus a single linear equality — anything more general would change the
+solver.
+
+### 14.2 KKT conditions and the active set
+
+**KKT (Karush–Kuhn–Tucker) conditions.** First-order conditions that any
+local optimum of a smooth constrained problem must satisfy: stationarity,
+primal feasibility, dual feasibility, and complementary slackness. For a
+convex problem they are also *sufficient* — satisfying them means you've
+found the global optimum (§2.5).
+
+**Stationarity.** The condition that the gradient of the Lagrangian
+vanishes at the optimum: in the rebalancer, `H y + c - nu * 1 - z = 0`.
+Geometrically, no feasible direction strictly improves the objective.
+
+**Primal and dual feasibility.** Primal feasibility: the solution `y*`
+satisfies all original constraints. Dual feasibility: every inequality
+multiplier has the correct sign — non-positive on a lower-bound multiplier,
+non-negative on an upper-bound multiplier.
+
+**Complementary slackness.** At the optimum, for every inequality
+constraint either the constraint is binding or its multiplier is zero —
+never both nonzero. The active-set method is engineered around this fact:
+it guesses which constraints are binding and tests the multiplier signs.
+
+**Lagrange multiplier (dual variable).** One scalar per constraint,
+measuring how much the optimal objective would change if that constraint
+were relaxed by one unit. Here `nu` rides the cash equality and `z_i` rides
+each box bound.
+
+**Active-set method.** A QP algorithm that maintains a guess of which
+inequality constraints are binding (the "active set"), solves the
+equality-constrained subproblem on that set, then releases or pins one
+constraint at a time: release if a multiplier sign is wrong, pin if a
+search step would violate a box. Each step strictly improves the objective
+and termination is finite for convex QPs (§6.3).
+
+**Equality-constrained QP (EQP).** A QP whose only constraints are linear
+equalities. It collapses to a single dense linear system — the KKT system
+— and is the subproblem the active-set method solves at every iteration.
+
+**Ratio test.** Given a search direction `p`, find the largest scalar
+`alpha in [0,1]` such that every free variable stays within its box after
+`y + alpha p`. The blocking variable (first to hit a bound) is added to
+the active set at that bound.
+
+### 14.3 Numerical linear algebra
+
+**Outer product.** Given column vectors `u`, `v`, the outer product `u v'`
+is the rank-1 matrix with entries `(u v')_ij = u_i v_j`. The deviation
+Hessian `H = sum_d 2 g_d (beta_d outer beta_d)` is a non-negative-weighted
+sum of such rank-1 PSD matrices, which is why it is automatically PSD.
+
+**Gradient.** The vector of partial derivatives of a scalar function; for
+the QP objective `grad = H y + c`. The active-set routine uses it both to
+generate search directions and to estimate the bound multipliers at pinned
+variables (`z = grad_i - nu`).
+
+**Gaussian elimination with partial pivoting.** A direct method for solving
+a dense linear system `A x = b`: at each pivot step, swap the row with the
+largest pivot entry into place, then eliminate below. Partial pivoting
+prevents division by tiny numbers and gives backward-stable behaviour; it
+is what `solveLin` in `engine.js` implements.
+
+**Tikhonov (ridge) regularization.** Adding `epsilon * I` to a PSD Hessian
+to make it strictly PD. The `(H + epsilon I) y = -c` system becomes
+well-conditioned and, where the original problem had ties, the regularizer
+picks the minimum-`y'y` representative — here `epsilon = 1e-7` is small
+enough not to bias the answer at any digit a user reads (§2.3).
+
+**Condition number.** A scalar that bounds how much rounding error in `b`
+or `H` can amplify into error in the solution of `H y = b`. A condition
+number near 1 is a stable solve; near `1 / eps_machine` the answer is
+noise. The §6.5 rescale keeps the QP's condition number in a workable
+range.
+
+**Numerical rescaling.** Multiplying both sides of the QP by a positive
+constant (here `1 / max|H|`) so the matrix entries are of order 1.
+Rescaling does not move the minimizer — multiplying an objective by a
+positive constant leaves its argmin unchanged — but it dramatically
+improves floating-point conditioning.
+
+### 14.4 Modelling techniques
+
+**Variable splitting (buy/sell decomposition).** Replacing a signed
+variable `x_i` with the difference of two non-negatives,
+`x_i = u_i - v_i`, `u_i, v_i >= 0`. This linearizes the non-differentiable
+`|x_i| = u_i + v_i` (exact at any optimum with positive cost on the
+variable) and lets a turnover-like term enter the QP's linear part cleanly
+(§2.1, §S4).
+
+**Piecewise-linear convex function.** A convex function expressible as a
+maximum of finitely many linear pieces, e.g. `|x| = max(x, -x)`. It is
+convex but not differentiable at the kinks; to enter a smooth QP it has to
+be linearized (e.g. variable splitting) or epigraphed first.
+
+**Linearization of non-convex ratios.** Rewriting a ratio like
+`weight_d(x) = sum a x / sum x` (non-convex in `x`) into a quantity that
+is linear in `x`, here `dev_d(x) = sum (a - t) x`. Squaring a linear
+quantity is a convex quadratic, which is admissible in a QP; the
+rebalancer's convex form is built on this trick (§2.2).
+
+**Scale-invariant normalization.** Dividing a problem term by a constant
+proportional to the natural scale (here `V0`) so the term's numerical
+value is unit-free. This keeps tuning constants like `theta` portable
+across portfolios of different sizes and makes the engine's behaviour
+book-independent (§2.3, §6.5).
+
+**Convex relaxation.** Replacing a non-convex term with the closest convex
+surrogate so the solver still applies. Fixed per-ticket fees
+(`k_fixed * 1[x != 0]`) and concave economies-of-scale are non-convex and
+out of scope here; the `$40` snap (§6.4) is a heuristic post-processing
+stand-in, not a true relaxation.
+
+### 14.5 Frontier analysis
+
+**Pareto / efficient frontier.** The set of solutions to a multi-objective
+problem that are not dominated by any other in every objective
+simultaneously. The rebalancer's cost-vs-completion curve, swept by
+`theta`, is one slice of such a frontier — each point is the best
+deviation reachable at a given cost (§6.6).
+
+**Concavity and diminishing returns.** A frontier `(rho, cost)` is concave
+in `rho` when each additional unit of completion costs strictly more than
+the last. This shape — the early dollars closing most of the miss, later
+dollars closing only a sliver — is the engine's diminishing-returns curve
+and the geometric reason a knee exists (§6.7).
+
+**Chord.** The straight line connecting two distinguished points on a
+curve. In the knee detector the chord runs from the no-trade endpoint
+`(0,0)` to the full-rebalance endpoint `(1,1)` of the normalized frontier;
+its slope is the rebalance's average cost-per-completion.
+
+**Perpendicular distance to a chord (Kneedle algorithm).** For each curve
+point, drop a perpendicular onto the chord and measure its length; the
+knee is the point of maximum distance. With the chord running corner to
+corner of the unit square the signed distance reduces to
+`(rho - c_norm)/sqrt(2)`, and its maximum doubles as the knee's sharpness
+`d_max` (§6.7).
+
+**Argmin / argmax.** The *argument* — the input value — at which a
+function attains its minimum (resp. maximum), as distinct from the
+optimum's value. The rebalancer solves `argmin_y F(y)` for the trade
+vector and locates the knee as `argmax_j d_j` on the swept frontier.
