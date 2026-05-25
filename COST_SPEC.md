@@ -13,7 +13,7 @@ Notation follows `WIKI.md`: `w0_i`, `V0`, `x_i`, `dev_d`, `e_d`, `b_d`, `H`,
 
 Two changes, one new control:
 
-1. The flat `TAU` turnover term (§9) is replaced by a real per-asset cost
+1. The flat `TAU` turnover term (§8) is replaced by a real per-asset cost
    model — linear commission plus optional quadratic impact. Each term is
    gated on an optional portfolio column; absent column → term off → current
    behavior. Commission is tier 1, impact tier 2.
@@ -24,10 +24,10 @@ Two changes, one new control:
    auto-locates the knee (the economically optimal point), solves there by
    default, and exposes a knob for the PM to override.
 
-The active-set solver (§6.3) is structurally unchanged — still box bounds
+The active-set solver (§5.3) is structurally unchanged — still box bounds
 plus one linear equality. The QP *assembly* in `rebalance` is rewritten
 (buy/sell variable split). Both `rebalancer.py` and `engine.js` change; they
-must stay in sync (§11.2).
+must stay in sync.
 
 ---
 
@@ -45,7 +45,7 @@ cost(x) = sum_i k_i |x_i|        (commission / spread, linear)
 - `q_i >= 0` — per-asset impact coefficient, units chosen so `q_i x_i^2` is
   dollars.
 
-Both terms are convex, so the QP stays convex (§11.5). The linear term is
+Both terms are convex, so the QP stays convex (§10.1). The linear term is
 piecewise-linear, handled by the buy/sell split (S4). The quadratic term
 drops into `H` directly (S5).
 
@@ -68,7 +68,7 @@ but no `impact_coef`, derive `q_i`; if neither, tier stays 1, nothing breaks.
 
 ## S3. Column schema additions
 
-Extends §7.2. New portfolio-sheet columns, matched by the existing `pick`
+Extends §6.1. New portfolio-sheet columns, matched by the existing `pick`
 rule (normalize, exact-then-substring).
 
 - commission rate — candidates: `cost, costbps, commission, spread, tc,
@@ -125,7 +125,7 @@ beta_d = [ b_d ; -b_d ]        length 2n
 ```
 
 with `e_d` unchanged. Assemble `H_y` (`2n x 2n`) and `c_y` (length `2n`) by
-the **existing** §6.1 accumulation, substituting `beta_d` for `b_d`. No new
+the **existing** §5.1 accumulation, substituting `beta_d` for `b_d`. No new
 formula — the same accumulation over the doubled coefficient vector.
 
 ### S4.2 Bounds and cash constraint over `y`
@@ -136,13 +136,13 @@ v_i in [0,  w0_i]           ( [0, w0_i + 4*V0] with shorts enabled )
 cash:  sum_i (u_i - v_i) = rhs        (rhs per mode, §3)
 ```
 
-Modes via pinning, replacing the §6.1 sign bounds:
+Modes via pinning, replacing the §5.1 sign bounds:
 
 - Mode A (sells only): pin `u_i = 0` for all `i`.
 - Mode D (buys only): pin `v_i = 0` for all `i`.
 - Modes B/C/E: no extra pinning.
 
-Still box + one equality — the active-set routine (§6.3) is untouched, only
+Still box + one equality — the active-set routine (§5.3) is untouched, only
 larger (`2n`).
 
 ---
@@ -157,7 +157,7 @@ F(y) = J_dev(y) + theta * cost(y) / V0
 - `theta >= 0` — cost-aversion weight, the sweep variable (S7). Not
   user-facing.
 - `/ V0` — mandatory normalization. Keeps the cost term scale-free so the
-  engine behaves identically across book sizes (§6.5). `k_i` and `q_i x_i^2 /
+  engine behaves identically across book sizes (§5.5). `k_i` and `q_i x_i^2 /
   V0` are already fractions; dividing by `V0` makes the whole term
   dimensionless and `theta` portable.
 
@@ -179,7 +179,7 @@ data (`k_i`, `q_i` are measured rates), not by `theta`.
 The old `TAU` term is removed. At tier 0, `k_i = COST_DEFAULT` flat, which
 reproduces the `TAU` tiebreaker role.
 
-Rescale and ridge (§6.1) proceed unchanged on the `2n` system.
+Rescale and ridge (§5.1) proceed unchanged on the `2n` system.
 
 ---
 
@@ -247,14 +247,14 @@ detector needs resolution to place the longest perpendicular leg accurately.
 
 ### S7.2 Snap disabled during the sweep
 
-The `$40` snap (§6.4) is **off** for every sweep solve. Snap is
+The `$40` snap (§5.4) is **off** for every sweep solve. Snap is
 post-processing, not optimization; leaving it on makes trades cross the $40
 threshold as `theta` moves, putting stair-steps in the curve that distort the
 perpendicular distances and produce fake knees. With snap off, the swept
 frontier is the true QP frontier — smooth, because the QP solution varies
 continuously in `theta`. No curve smoothing or spline fitting is needed.
 
-The long-only clamp (§6.4) stays on during the sweep — it is a feasibility
+The long-only clamp (§5.4) stays on during the sweep — it is a feasibility
 correction, not cosmetic.
 
 ---
@@ -355,7 +355,7 @@ not (S8.1).
 1. Determine target `rho`: the knee (S8.2), or the PM's knob override.
 2. Solve `F(y)` at the corresponding `theta` (interpolate `theta` from the
    ladder, then one exact solve).
-3. Apply post-processing (§6.4) — long-only clamp, then `$40` snap — to this
+3. Apply post-processing (§5.4) — long-only clamp, then `$40` snap — to this
    **final** solution only.
 4. Recompute `J_dev`, `rho`, and `cost` of the snapped solution. Report the
    delta from the pre-snap marker (`snap_delta`, S10) so the PM sees the real
@@ -368,7 +368,7 @@ final rounding (sub-$40 per trade) whose effect is measured and shown.
 
 ## S10. Diagnostics additions
 
-Extends §8. New fields in `diagnostics`:
+Extends §7. New fields in `diagnostics`:
 
 - `total_cost` — `cost(x)` in dollars of the delivered solution.
 - `cost_bps` — `total_cost / V0 * 1e4`.
@@ -393,7 +393,7 @@ volume. In B/C/E cost also shrinks total turnover. Surface this so a PM is
 not surprised cost "does nothing" to turnover in mode A — emit
 `cost_affects = "selection"` (A, D) or `"selection+volume"` (B, C, E).
 
-Field names are contract (§8) — identical across `rebalancer.py`,
+Field names are contract (§7) — identical across `rebalancer.py`,
 `engine.js`, `widget_ui.js`.
 
 ---
@@ -417,7 +417,8 @@ Field names are contract (§8) — identical across `rebalancer.py`,
 
 ## S12. Reference test cases
 
-Extends §12.
+Companion to the worked example in `WIKI.md` §2.7 — these are the
+cost-model-specific cases.
 
 - **Tier 0 equivalence.** Workbook with no cost column → flat
   `k_i = COST_DEFAULT` → trade vector matches the pre-change `TAU` engine to
@@ -460,7 +461,7 @@ The old `TAU` (`1e-4`) is removed from the objective.
 
 - Fixed per-ticket fees `k_fixed * 1[x_i != 0]` — a 0/1 indicator,
   non-convex (cardinality), breaks the active-set solver. The `$40` snap
-  (§6.4) is the pragmatic stand-in. Heuristic upgrade if needed: solve
+  (§5.4) is the pragmatic stand-in. Heuristic upgrade if needed: solve
   convex, snap, re-solve with snapped assets pinned at 0.
 - Concave cost (economies of scale) — non-convex, out.
 - Hard cost budget (`cost <= B`) — a second linear inequality, a real solver
@@ -484,9 +485,9 @@ The old `TAU` (`1e-4`) is removed from the objective.
 4. `rebalancer.py`: knee detector (S8), final-solve + snap-delta (S9),
    diagnostics fields (S10).
 5. Port 2–4 to `engine.js` line-for-line.
-6. Cross-check both engines (S12, §12.4).
+6. Cross-check both engines (S12).
 7. `widget_ui.js`: frontier plot, knee marker, `rho` knob (S11).
-8. Update `WIKI.md` §9 (constants), §11.5 (cost term now implemented).
+8. Update `WIKI.md` §8 (constants), §10.1 (cost term now implemented).
 
 Steps 2–5 are the math change — `rebalancer.py` and `engine.js` must land
-together (§11.2).
+together.
