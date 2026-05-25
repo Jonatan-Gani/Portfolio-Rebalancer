@@ -498,9 +498,13 @@ can cost far less than a proportional share of full-rebalance turnover.
 That gap is the diminishing-returns shape of the frontier and the reason a
 knee exists (§6.7).
 
-`R_0`, `R_perfect` and the frontier are all mode-specific. The `theta`
-ladder is anchored to the portfolio and refined where the frontier is
-sparsely sampled; details in `COST_SPEC.md` §S7.
+`R_0`, `R_perfect` and the frontier are all mode-specific. If
+`R_0 - R_perfect < 1e-12` the portfolio is already on target — the engine
+skips the sweep, returns the no-trade solution, and reports `rho = 1`.
+Otherwise the `theta` ladder is anchored to the portfolio
+(`anchor = (R_0 - R_perfect) / cost_max`, where `cost_max` is `cost(x)` at
+the `theta = 0` solution) and refined where the frontier is sparsely
+sampled; full procedure in `COST_SPEC.md` §S7.
 
 ### 6.7 The knee — the default operating point
 
@@ -512,11 +516,12 @@ marginal cost of further completion has risen to meet its marginal benefit,
 so trading past it spends a dollar to save less than a dollar.
 
 The knee is located by maximum distance to the chord. Normalize both
-frontier axes to `[0,1]` (`rho` already is; `c_norm = cost / cost_max`).
-Draw the chord from the no-trade endpoint `(0,0)` to the full-rebalance
-endpoint `(1,1)` — the chord is the rebalance's average cost per unit of
-completion. For each frontier point the engine measures the perpendicular
-distance to that chord,
+frontier axes to `[0,1]` (`rho` already is; `c_norm = cost / cost_max`,
+where `cost_max` is the full-rebalance cost at `theta = 0`). Draw the chord
+from the no-trade endpoint `(0,0)` to the full-rebalance endpoint `(1,1)`
+— the chord is the rebalance's average cost per unit of completion. For
+each frontier point the engine measures the perpendicular distance to that
+chord,
 
 ```
 d_j = ( rho_j - c_norm_j ) / sqrt(2)
@@ -529,9 +534,11 @@ above it slower. The two views describe the same point.
 
 The longest distance `d_max` doubles as the knee's sharpness. A pronounced
 knee bows far from the chord; a gently bowed frontier with no real corner
-hugs it. If `d_max` falls below a calibrated minimum the engine reports no
-sharp optimum and defers the choice to the user rather than marking a knee
-that is not there.
+hugs it. If `d_max` falls below `KNEE_MIN_LEG` (§9) the engine reports
+**gradual tradeoff — no sharp optimum**, suppresses the knee marker,
+defaults the recommendation to `rho = 0.90`, and prompts the user to
+choose. An honest "no clear optimum" beats a confident marker on a flat
+curve.
 
 The knee is computed on the true (un-snapped) frontier. The final solution
 — the knee, or a user override along `rho` — is solved once at the
@@ -564,6 +571,10 @@ candidate list first; substring fallback second; absent if neither.
 Portfolio candidates:
 - ticker: `ticker, symbol, security, name, id, asset`
 - value: `value, marketvalue, mv, amount, dollars, notional, weight`
+- commission rate (optional, tier 1): `cost, costbps, commission, spread, tc, ticketcost`
+- impact coefficient (optional, tier 2): `impact, impactcoef, marketimpact, qimpact`
+- ADV (optional, used to derive impact): `adv, avgdailyvolume, advusd`
+- volatility (optional, used to derive impact): `vol, volatility, sigma`
 
 Targets candidates:
 - label: `label, name, dimension, target, id`
@@ -582,6 +593,14 @@ missing attribute/target, raises an error.
 
 Portfolio: drop rows with empty ticker; coerce value to numeric (unparseable
 → 0); every other column is a free-form profiling variable.
+
+Cost columns are the exception to the "unparseable → 0" rule. A blank cost
+cell takes the **90th percentile** of that column's known values, not 0 — a
+0 would read as "this asset is free to trade" and route all flow through it.
+When a cost column is absent entirely, every `k_i` defaults to
+`COST_DEFAULT` (§9). A rate column given in basis points (`costbps`, or any
+column whose values exceed 1) is divided by `1e4` on read so `k_i` is a
+plain fraction. Full schema in `COST_SPEC.md` §S3.
 
 Targets: each row is one dimension, unless its attribute cell is empty
 (skipped). The attribute must name a portfolio column, else the row records
@@ -636,16 +655,18 @@ unscoped; else `achieved/Sv` (scoped, zero target). NaN/inf → 0.
 The exact field names are part of the contract — `widget_ui.js` and any
 integration bind to them.
 
-The cost model adds to `diagnostics`: `total_cost` (commission paid, $),
+The cost model adds to `diagnostics`: `total_cost` (cost paid, $),
 `cost_bps` (`total_cost / V0 * 1e4`), `objective_deviation` and
 `objective_cost` (the two terms of `objective_value`, reported
 separately), `rho_achieved` (completion fraction of the delivered
 solution), `knee_rho` (knee location, or null when no sharp knee),
 `knee_leg` (`d_max`, the longest perpendicular distance — the sharpness
 measure), `frontier` (the swept `(rho, cost, J_dev)` points),
-`snap_delta` (the `rho` and cost shift from snapping the final solution),
-and `cost_tier` (0 no cost data, 1 commission). Each `trades` entry gains
-`trade_cost`, the commission on that holding.
+`snap_delta` (`{ d_rho, d_cost }`, pre-snap vs post-snap shifts on the
+final solution), `cost_tier` (`0` flat fallback, `1` commission only, `2`
+commission + impact), and `cost_default_used` (bool — true if any asset
+used a defaulted rate). Each `trades` entry gains `trade_cost`, the
+per-asset cost `k_i|x_i| + q_i x_i^2`.
 
 In pinned-cash modes (A, D) total traded volume is largely fixed by the
 cash target, so commission steers *which* holdings trade, not how much; in
@@ -733,20 +754,26 @@ Compute it in `_diagnose` (Python) and `diagnose` (JS), add it to the
 returned `diagnostics` object in both, and render it in `widget_ui.js`'s
 `run` (the diagnostics grid). Keep the field name identical across all three.
 
-### 11.5 The cost model and its extension
+### 11.5 The cost model and its tiers
 
-Transaction cost is part of the core engine (§2.3): a linear commission
-term, per-asset rate `k_i`, entering `c` over the buy/sell-split variables.
-It is convex, so the QP and the active-set solver are unaffected.
+Transaction cost is part of the core engine (§2.3) and runs in three tiers,
+each gated on what the portfolio sheet supplies. The QP stays convex at
+every tier, so the active-set solver is unaffected.
 
-Market impact — a cost that grows faster than trade size — is the supported
-**extension**. It is modelled as a quadratic term `sum_i q_i x_i^2`, which
-is convex and drops straight onto the diagonal of `H` (the Hessian of
-`q_i (u_i - v_i)^2`), again with no solver change. It is opt-in because the
-impact coefficient `q_i` is a derived quantity — typically
-`q_i ~ c sigma_i / ADV_i` from volatility and average daily volume — and
-most mandates do not supply it. Absent the data, the term is simply off.
-Implementation detail in `COST_SPEC.md` §S2, §S5.
+- **Tier 0 — no cost column.** Every asset uses the flat `COST_DEFAULT`
+  rate (§9). The cost term is in the objective but a uniform `k` cancels
+  out of the normalized chord (§6.7), so the knee location is identical
+  to the no-cost baseline.
+- **Tier 1 — commission column present.** Per-asset `k_i` enters `c` over
+  the buy/sell-split variables: `c[u_i] += theta k_i / V0` and
+  `c[v_i] += theta k_i / V0`. Linear, convex, no solver change.
+- **Tier 2 — commission + impact.** A per-asset quadratic impact term
+  `sum_i q_i x_i^2` drops straight onto `H` (the Hessian of
+  `q_i (u_i - v_i)^2` lives in the four `n x n` blocks linking `u_i` and
+  `v_i`). Still convex, still no solver change. `q_i` can be read from an
+  `impact` column directly or derived from ADV and volatility columns
+  (`q_i ~ c sigma_i / ADV_i`); absent both, the engine stays at tier 1.
+  Full assembly in `COST_SPEC.md` §S2, §S5.
 
 A non-convex cost — fixed per-ticket fees (a 0/1 indicator on whether a
 holding trades) or concave economies-of-scale pricing — would break the
@@ -827,9 +854,10 @@ A faithful rebuild satisfies all of:
    equality; numeric = coerced number).
 5. Variables `y = [u; v]` of length `2n` per §2.1; objective `H, c` over `y`
    per §6.1 with the dual `g` scaling and the `beta_d = [b_d; -b_d]` stack.
-6. Commission term per §2.3: `c[u_i] += theta k_i / V0` and
-   `c[v_i] += theta k_i / V0`; rescale by `max|H|`, then add the `1e-7`
-   ridge.
+6. Cost terms by tier (§11.5): commission (tier 1) contributes
+   `c[u_i] += theta k_i / V0` and `c[v_i] += theta k_i / V0`; impact
+   (tier 2) contributes the `q_i (u_i - v_i)^2` Hessian onto `H` per
+   `COST_SPEC.md` §S5. Then rescale by `max|H|` and add the `1e-7` ridge.
 7. Bounds (`u_i >= 0`, `v_i in [0, w0_i]` or `[0, w0_i + 4 V0]` with shorts)
    and cash constraint `sum_i (u_i - v_i) = rhs` per mode (§3, §6.1); mode
    pinning of `u_i = 0` (A) or `v_i = 0` (D).
@@ -847,8 +875,8 @@ A faithful rebuild satisfies all of:
 13. Diagnostics per §8 with the exact field names — including `total_cost`,
     `cost_bps`, `objective_deviation`, `objective_cost`, `rho_achieved`,
     `knee_rho`, `knee_leg`, `frontier`, `snap_delta`, `cost_tier`,
-    `cost_affects`, and per-trade `trade_cost` — and the three-way
-    `residual_pct` rule.
+    `cost_default_used`, `cost_affects`, and per-trade `trade_cost` — and
+    the three-way `residual_pct` rule.
 14. All edge cases of §10.
 15. The §12 test cases reproduced to the stated precision.
 
@@ -861,7 +889,8 @@ active-set solver. Targets are soft goals balanced by priority, not hard
 constraints; the cash-flow rule of the chosen mode is the only hard
 constraint, plus the no-short rule unless shorting is enabled.
 
-Transaction cost is priced and optimized: a linear commission term in the
-core objective, with market impact available as a convex quadratic
-extension. Cost is a priced soft term, not a hard constraint — the
-cash-flow rule of the mode remains the only hard constraint.
+Transaction cost is priced and optimized in tiers: a linear commission
+term (tier 1) and a convex quadratic market-impact term (tier 2), each
+gated on the corresponding portfolio column, with a flat fallback at
+tier 0. Cost is a priced soft term, not a hard constraint — the cash-flow
+rule of the mode remains the only hard constraint.
